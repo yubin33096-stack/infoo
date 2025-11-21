@@ -1,0 +1,156 @@
+Python 3.12.3 (tags/v3.12.3:f6650f9, Apr  9 2024, 14:05:25) [MSC v.1938 64 bit (AMD64)] on win32
+Type "help", "copyright", "credits" or "license()" for more information.
+import streamlit as st
+import google.generativeai as genai
+from datetime import datetime
+import csv
+import io
+import time
+
+# ----------------------------
+# 초기 설정
+# ----------------------------
+st.set_page_config(page_title="AI 웨이팅 알림 챗봇", layout="wide")
+st.title("🍽️ AI 웨이팅 알림 챗봇 (Gemini API + Streamlit)")
+
+# Gemini API Key
+if "GEMINI_API_KEY" not in st.secrets:
+    api_key = st.text_input("Gemini API Key를 입력하세요:", type="password")
+else:
+    api_key = st.secrets["GEMINI_API_KEY"]
+
+if api_key:
+    genai.configure(api_key=api_key)
+
+# 모델 선택
+model_list = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+model = st.selectbox("모델 선택", model_list)
+
+# 시스템 프롬프트
+SYSTEM_PROMPT = """
+당신은 식당 웨이팅 안내를 도와주는 '친절한 상담 챗봇'입니다.
+
+규칙:
+1) 사용자는 식당을 찾는 과정에서 얼마나 기다려야 하는지 불편함을 표현할 수 있습니다.  
+   → 정중하고 공감 어린 말투로 응대하세요.
+
+2) 사용자의 불편 사항을 (무엇이/언제/어디서/어떻게) 형태로 정리하여 수집하고  
+   → “곧 확인하여 안내드린다”는 취지로 답변하세요.
+
+3) 마지막 문장은 반드시 다음 중 하나가 되어야 합니다:
+   - 기본: “확인 후 회신을 위해 이메일 주소를 알려주실 수 있을까요?”
+   - 사용자가 이메일 제공을 거부하면:  
+     “죄송하지만, 연락처 정보를 받지 못하여 웨이팅 내용을 받으실 수 없어요.”
+
+4) 절대 공격적, 무례한 표현 사용 금지.
+"""
+
+# 세션 초기화
+if "messages" not in st.session_state:
+    st.session_state.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+if "log" not in st.session_state:
+    st.session_state.log = []
+
+# CSV 옵션
+save_csv = st.checkbox("대화를 CSV로 자동 저장")
+
+
+# -----------------------------------------
+# 함수: Gemini Call with Retry + 429핸들링
+# -----------------------------------------
+def call_gemini_with_retry(prompt, retries=3, delay=2):
+    for attempt in range(retries):
+        try:
+            client = genai.GenerativeModel(model)
+            response = client.generate_content(prompt)
+            return response.text
+        except Exception as e:
+            if "429" in str(e):
+                time.sleep(delay)
+                continue
+            return f"⚠️ 오류 발생: {str(e)}"
+    return "⚠️ 연속된 429 오류로 새 세션이 시작됩니다. 다시 입력해주세요."
+
+
+# -----------------------------------------
+# UI - 대화 출력
+# -----------------------------------------
+st.subheader("💬 대화")
+
+for msg in st.session_state.messages[1:]:
+    if msg["role"] == "user":
+        st.chat_message("user").write(msg["content"])
+    else:
+        st.chat_message("assistant").write(msg["content"])
+
+
+# -----------------------------------------
+# 입력창
+# -----------------------------------------
+user_input = st.chat_input("메시지를 입력하세요...")
+
+if user_input:
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    st.chat_message("user").write(user_input)
+
+    # 최근 6턴만 유지
+    recent_context = st.session_state.messages[-6:]
+    merged = "\n".join([f"{m['role']}: {m['content']}" for m in recent_context])
+
+    # Gemini API 호출
+    assistant_reply = call_gemini_with_retry(merged)
+
+    # 429 재시작 메시지면 세션 리셋
+    if "429 오류" in assistant_reply:
+        st.session_state.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    else:
+        st.session_state.messages.append({"role": "assistant", "content": assistant_reply})
+        st.chat_message("assistant").write(assistant_reply)
+
+    # 로그 저장
+    st.session_state.log.append({
+        "timestamp": datetime.now().isoformat(),
+        "user": user_input,
+        "assistant": assistant_reply
+    })
+
+    # CSV 자동 저장
+...     if save_csv:
+...         with open("chat_log.csv", "a", newline="", encoding="utf-8") as f:
+...             writer = csv.writer(f)
+...             writer.writerow([datetime.now().isoformat(), user_input, assistant_reply])
+... 
+... 
+... # -----------------------------------------
+... # 로그 다운로드
+... # -----------------------------------------
+... st.subheader("📥 로그 다운로드")
+... if st.button("CSV 다운로드"):
+...     csv_buffer = io.StringIO()
+...     writer = csv.writer(csv_buffer)
+...     writer.writerow(["timestamp", "user", "assistant"])
+...     for row in st.session_state.log:
+...         writer.writerow([row["timestamp"], row["user"], row["assistant"]])
+... 
+...     st.download_button(
+...         label="chat_log.csv 다운로드",
+...         data=csv_buffer.getvalue(),
+...         file_name="chat_log.csv",
+...         mime="text/csv"
+...     )
+... 
+... 
+... # -----------------------------------------
+... # 대화 초기화 버튼
+... # -----------------------------------------
+... if st.button("🔄 대화 초기화"):
+...     st.session_state.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+...     st.session_state.log = []
+...     st.rerun()
+... 
+... 
+... # -----------------------------------------
+... # 모델/세션 표시
+... # -----------------------------------------
+... st.markdown(f"---\n**현재 모델:** `{model}`  
